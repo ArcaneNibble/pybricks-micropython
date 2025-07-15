@@ -23,23 +23,86 @@ static const pbdrv_gpio_t pin_sound_en = PBDRV_GPIO_EV3_PIN(13, 3, 0, 6, 15);
 #define SYSCFG_PINMUX3_PINMUX3_7_4_GPIO0_0 0
 static const pbdrv_gpio_t pin_audio = PBDRV_GPIO_EV3_PIN(3, 7, 4, 0, 0);
 
+// This hardware is not capable of producing 16 bits per sample
+// at an acceptable sampling rate. As a trade-off, use 12 bits per sample
+// giving a sampling rate of 150 MHz / 2**12 ~= 36 ksps
+static const unsigned N_BITS_PER_SAMPLE = 12;
+
+static uint32_t hw_sample_idx;
+static const uint16_t *playing_data;
+static uint32_t playing_data_len;
+static uint32_t playing_sample_rate;
+
 static void sound_isr() {
-    static int test = 0;
-    IntSystemStatusClear(SYS_INT_EHRPWM0);
     EHRPWMETIntClear(SOC_EHRPWM_0_REGS);
-    if (++test == 880) {
-        test = 0;
-        HWREGB(SOC_UART_1_REGS) = 'A';
+    IntSystemStatusClear(SYS_INT_EHRPWM0);
+
+    hw_sample_idx++;
+
+    // Convert the hardware sample index to a desired data sample index
+    // (using a naive ratio, rearranged to be computable with integers)
+    // TODO: Use a real DSP resampling algorithm
+    uint64_t playing_sample_idx = (uint64_t)hw_sample_idx * (uint64_t)playing_sample_rate * (1ull << N_BITS_PER_SAMPLE) / (uint64_t)SOC_EHRPWM_0_MODULE_FREQ;
+    // TODO: Make sure the index wraparound works properly
+    playing_sample_idx %= playing_data_len;
+
+    uint16_t sample = playing_data[playing_sample_idx];
+    // TODO: Dither the quantization error
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_CMPB) = sample >> (16 - N_BITS_PER_SAMPLE);
+}
+
+void pbdrv_sound_stop() {
+    // Turn speaker amplifier off
+    pbdrv_gpio_out_low(&pin_sound_en);
+    // Clean up counter
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_TBCTL) |= EHRPWM_TBCTL_CTRMODE_STOPFREEZE;
+    EHRPWMWriteTBCount(SOC_EHRPWM_0_REGS, 0);
+    EHRPWMETIntDisable(SOC_EHRPWM_0_REGS);
+    EHRPWMETIntClear(SOC_EHRPWM_0_REGS);
+    // Disable shadowing and set the count to 0
+    EHRPWMLoadCMPB(SOC_EHRPWM_0_REGS, 0, true, 0, true);
+    // Re-enable shadowing
+    EHRPWMLoadCMPB(SOC_EHRPWM_0_REGS, 0, false, EHRPWM_CMPCTL_LOADBMODE_TBCTRPRD, true);
+}
+
+void pbdrv_sound_start(const uint16_t *data, uint32_t length, uint32_t sample_rate) {
+    // Stop any currently-playing sounds
+    pbdrv_sound_stop();
+
+    if (length == 0) {
+        return;
     }
+
+    __asm__ volatile("":::"memory");
+    playing_data = data;
+    playing_data_len = length;
+    playing_sample_rate = sample_rate;
+    hw_sample_idx = 0;
+    __asm__ volatile("":::"memory");
+
+    // Set the first sample
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_CMPB) = data[0] >> (16 - N_BITS_PER_SAMPLE);
+
+    // Enable all the sound generation
+    pbdrv_gpio_out_high(&pin_sound_en);
+    EHRPWMETIntEnable(SOC_EHRPWM_0_REGS);
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_TBCTL) = (HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_TBCTL) & ~EHRPWM_TBCTL_CTRMODE) | EHRPWM_TBCTL_CTRMODE_UP;
 }
 
 void pbdrv_sound_init() {
     // Turn on EPWM
     PSCModuleControl(SOC_PSC_1_REGS, HW_PSC_EHRPWM, PSC_POWERDOMAIN_ALWAYS_ON, PSC_MDCTL_NEXT_ENABLE);
 
-    EHRPWMTimebaseClkConfig(SOC_EHRPWM_0_REGS, SOC_EHRPWM_0_MODULE_FREQ / 10, SOC_EHRPWM_0_MODULE_FREQ);
-    EHRPWMPWMOpFreqSet(SOC_EHRPWM_0_REGS, SOC_EHRPWM_0_MODULE_FREQ / 10, 440, EHRPWM_COUNT_UP, true);
-    EHRPWMLoadCMPB(SOC_EHRPWM_0_REGS, SOC_EHRPWM_0_MODULE_FREQ / 10 / 440 / 2, true, 0, true);
+    // The stop function performs various initializations
+    pbdrv_sound_stop();
+
+    // Set up settings which will stay consistent throughout
+    EHRPWMTimebaseClkConfig(SOC_EHRPWM_0_REGS, SOC_EHRPWM_0_MODULE_FREQ, SOC_EHRPWM_0_MODULE_FREQ);
+    // Set the period to go up to max of nbits
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_TBCTL) |= EHRPWM_TBCTL_PRDLD;
+    HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_TBPRD) = (1 << N_BITS_PER_SAMPLE) - 1;
+    // Pulse goes high @ t=0
+    // Pulse goes low  @ t=CMPB
     EHRPWMConfigureAQActionOnB(
         SOC_EHRPWM_0_REGS,
         EHRPWM_AQCTLB_ZRO_EPWMXBHIGH,
@@ -50,6 +113,7 @@ void pbdrv_sound_init() {
         EHRPWM_AQCTLB_CBD_DONOTHING,
         EHRPWM_AQSFRC_ACTSFB_DONOTHING
         );
+    // Disable unused features
     EHRPWMDBOutput(SOC_EHRPWM_0_REGS, EHRPWM_DBCTL_OUT_MODE_BYPASS);
     EHRPWMChopperDisable(SOC_EHRPWM_0_REGS);
     EHRPWMTZTripEventDisable(SOC_EHRPWM_0_REGS, false);
@@ -61,19 +125,9 @@ void pbdrv_sound_init() {
     IntSystemEnable(SYS_INT_EHRPWM0);
     EHRPWMETIntSourceSelect(SOC_EHRPWM_0_REGS, EHRPWM_ETSEL_INTSEL_TBCTREQUPRD);
     EHRPWMETIntPrescale(SOC_EHRPWM_0_REGS, EHRPWM_ETPS_INTPRD_FIRSTEVENT);
-    EHRPWMETIntEnable(SOC_EHRPWM_0_REGS);
 
-    // Configure IO pin modes
+    // Configure IO pin mode
     pbdrv_gpio_alt(&pin_audio, SYSCFG_PINMUX3_PINMUX3_7_4_EPWM0B);
-    pbdrv_gpio_out_high(&pin_sound_en);
-}
-
-void pbdrv_sound_start(const uint16_t *data, uint32_t length, uint32_t sample_rate) {
-
-}
-
-void pbdrv_sound_stop() {
-
 }
 
 #endif // PBDRV_CONFIG_SOUND_EV3

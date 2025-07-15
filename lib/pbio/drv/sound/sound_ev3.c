@@ -9,6 +9,7 @@
 
 #include <pbdrv/gpio.h>
 
+#include <tiam1808/armv5/am1808/interrupt.h>
 #include <tiam1808/ehrpwm.h>
 #include <tiam1808/hw/soc_AM1808.h>
 #include <tiam1808/hw/hw_syscfg0_AM1808.h>
@@ -21,6 +22,16 @@ static const pbdrv_gpio_t pin_sound_en = PBDRV_GPIO_EV3_PIN(13, 3, 0, 6, 15);
 // Audio output pin
 #define SYSCFG_PINMUX3_PINMUX3_7_4_GPIO0_0 0
 static const pbdrv_gpio_t pin_audio = PBDRV_GPIO_EV3_PIN(3, 7, 4, 0, 0);
+
+static void sound_isr() {
+    static int test = 0;
+    IntSystemStatusClear(SYS_INT_EHRPWM0);
+    EHRPWMETIntClear(SOC_EHRPWM_0_REGS);
+    if (++test == 880) {
+        test = 0;
+        HWREGB(SOC_UART_1_REGS) = 'A';
+    }
+}
 
 void pbdrv_sound_init() {
     // Turn on EPWM
@@ -43,6 +54,14 @@ void pbdrv_sound_init() {
     EHRPWMChopperDisable(SOC_EHRPWM_0_REGS);
     EHRPWMTZTripEventDisable(SOC_EHRPWM_0_REGS, false);
     EHRPWMTZTripEventDisable(SOC_EHRPWM_0_REGS, true);
+
+    // Interrupts
+    IntRegister(SYS_INT_EHRPWM0, sound_isr);
+    IntChannelSet(SYS_INT_EHRPWM0, 2);
+    IntSystemEnable(SYS_INT_EHRPWM0);
+    EHRPWMETIntSourceSelect(SOC_EHRPWM_0_REGS, EHRPWM_ETSEL_INTSEL_TBCTREQUPRD);
+    EHRPWMETIntPrescale(SOC_EHRPWM_0_REGS, EHRPWM_ETPS_INTPRD_FIRSTEVENT);
+    EHRPWMETIntEnable(SOC_EHRPWM_0_REGS);
 
     // Configure IO pin modes
     pbdrv_gpio_alt(&pin_audio, SYSCFG_PINMUX3_PINMUX3_7_4_EPWM0B);

@@ -121,7 +121,7 @@ void pbdrv_sound_init() {
 
     // Interrupts
     IntRegister(SYS_INT_EHRPWM0, sound_isr);
-    IntChannelSet(SYS_INT_EHRPWM0, 2);
+    IntChannelSet(SYS_INT_EHRPWM0, 1);
     IntSystemEnable(SYS_INT_EHRPWM0);
     EHRPWMETIntSourceSelect(SOC_EHRPWM_0_REGS, EHRPWM_ETSEL_INTSEL_TBCTREQUPRD);
     EHRPWMETIntPrescale(SOC_EHRPWM_0_REGS, EHRPWM_ETPS_INTPRD_FIRSTEVENT);

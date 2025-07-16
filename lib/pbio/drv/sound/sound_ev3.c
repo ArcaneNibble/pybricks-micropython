@@ -28,7 +28,9 @@ static const pbdrv_gpio_t pin_audio = PBDRV_GPIO_EV3_PIN(3, 7, 4, 0, 0);
 // giving a sampling rate of 150 MHz / 2**12 ~= 36 ksps
 static const unsigned N_BITS_PER_SAMPLE = 12;
 
-static uint32_t hw_sample_idx;
+static uint64_t sample_timing_accum_numerator;
+static uint32_t sample_idx;
+
 static const uint16_t *playing_data;
 static uint32_t playing_data_len;
 static uint32_t playing_sample_rate;
@@ -37,16 +39,19 @@ static void sound_isr() {
     EHRPWMETIntClear(SOC_EHRPWM_0_REGS);
     IntSystemStatusClear(SYS_INT_EHRPWM0);
 
-    hw_sample_idx++;
-
     // Convert the hardware sample index to a desired data sample index
     // (using a naive ratio, rearranged to be computable with integers)
     // TODO: Use a real DSP resampling algorithm
-    uint64_t playing_sample_idx = (uint64_t)hw_sample_idx * (uint64_t)playing_sample_rate * (1ull << N_BITS_PER_SAMPLE) / (uint64_t)SOC_EHRPWM_0_MODULE_FREQ;
-    // TODO: Make sure the index wraparound works properly
-    playing_sample_idx %= playing_data_len;
+    sample_timing_accum_numerator += (uint64_t)playing_sample_rate * (1ull << N_BITS_PER_SAMPLE);
+    if (sample_timing_accum_numerator >= SOC_EHRPWM_0_MODULE_FREQ) {
+        sample_timing_accum_numerator -= SOC_EHRPWM_0_MODULE_FREQ;
+        sample_idx++;
+    }
+    if (sample_idx == playing_data_len) {
+        sample_idx = 0;
+    }
 
-    uint16_t sample = playing_data[playing_sample_idx];
+    uint16_t sample = playing_data[sample_idx];
     // TODO: Dither the quantization error
     HWREGH(SOC_EHRPWM_0_REGS + EHRPWM_CMPB) = sample >> (16 - N_BITS_PER_SAMPLE);
 }
@@ -77,7 +82,8 @@ void pbdrv_sound_start(const uint16_t *data, uint32_t length, uint32_t sample_ra
     playing_data = data;
     playing_data_len = length;
     playing_sample_rate = sample_rate;
-    hw_sample_idx = 0;
+    sample_idx = 0;
+    sample_timing_accum_numerator = 0;
     __asm__ volatile("":::"memory");
 
     // Set the first sample
